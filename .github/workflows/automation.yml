@@ -1,0 +1,36 @@
+name: Challenge automation
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "run = تنفيذ فعلي | check = فحص فقط بدون أي تعديل"
+        type: choice
+        default: run
+        options: [run, check]
+
+concurrency:
+  group: challenge-automation
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm install --omit=dev --no-audit --no-fund
+        working-directory: automation
+      - run: node index.js
+        working-directory: automation
+        env:
+          TZ: UTC
+          MODE: ${{ github.event.inputs.mode || 'run' }}
+          FIREBASE_KEY: ${{ secrets.FIREBASE_KEY }}
+          ONESIGNAL_APP_ID: ${{ secrets.ONESIGNAL_APP_ID }}
+          ONESIGNAL_REST_KEY: ${{ secrets.ONESIGNAL_REST_KEY }}

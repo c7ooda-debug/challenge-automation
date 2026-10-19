@@ -25,9 +25,7 @@ jobs:
         with:
           node-version: 20
       - run: npm install --omit=dev --no-audit --no-fund
-        working-directory: automation
       - run: node index.js
-        working-directory: automation
         env:
           TZ: UTC
           MODE: ${{ github.event.inputs.mode || 'run' }}

@@ -4,6 +4,9 @@
 // 3) إلغاء الحجوزات غير المسددة بعد المهلة المضبوطة في إعدادات الأكاديمية + تذكير عند نصف المهلة
 // 4) نظام التقييد (المخالفات)  5) الدورة الشهرية: تثبيت / تجديد / تذكير سداد / إلغاء + إشعار تغيّر المرحلة
 // 6) نظام البدلاء: بناء المرشحين، فتح الموعد بعد المهلة، تنفيذ القبول/الرفض، إبلاغ قائمة الانتظار
+// 7) إشعار جدول المدرب اليومي الساعة 6 صباحًا (يُسجَّل لكل مدرب على حدة)
+// 8) تذكير اللاعبين/أولياء الأمور بحصص اليوم: إشعار صباحي + تذكير قبل الحصة بساعتين
+// 9) حذف حسابات الدخول نهائياً بعد حذف العضو من التطبيق   10) فحص الحسابات عند الطلب (حسابات بلا ملف / ملفات بلا حساب)
 
 const admin = require("firebase-admin");
 const FieldValue = admin.firestore.FieldValue;
@@ -49,7 +52,7 @@ function activeMinutes(fromReal, toReal) {
 // ---------- الإشعارات (إشعار داخل التطبيق + Push عبر OneSignal) ----------
 async function pushTo(target, n, nid) {
   const appId = process.env.ONESIGNAL_APP_ID, key = process.env.ONESIGNAL_REST_KEY;
-  if (!appId || !key) return;
+  if (!appId || !key) return { skipped: true, ok: false, invalid: [] };
   const res = await fetch("https://api.onesignal.com/notifications?c=push", {
     method: "POST",
     headers: { "Content-Type": "application/json; charset=utf-8", Authorization: `Key ${key}` },
@@ -65,14 +68,62 @@ async function pushTo(target, n, nid) {
       priority: 10,
     }),
   });
-  if (!res.ok) console.log("OneSignal", res.status, (await res.text()).slice(0, 200));
+  if (!res.ok) {
+    console.log("OneSignal", res.status, (await res.text()).slice(0, 200));
+    return { ok: false, invalid: [], error: "OneSignal " + res.status };
+  }
+  // OneSignal lists the recipients it could not reach (no subscribed device).
+  let j = {};
+  try { j = await res.json(); } catch (_) {}
+  let invalid = [];
+  try {
+    const v = j && j.errors && j.errors.invalid_aliases && j.errors.invalid_aliases.external_id;
+    if (Array.isArray(v)) invalid = v.map(String);
+  } catch (_) {}
+  return { ok: true, invalid, noneSent: !(j && j.id) };
+}
+
+// ---------- سجل الإشعارات: من وصله ومن لم يصله (يظهر للأدمن في التطبيق) ----------
+function statusFor(uid, r) {
+  if (!r || r.skipped || !r.ok) return "failed";
+  if (r.noneSent || r.invalid.includes(uid)) return "nodevice";
+  return "sent";
+}
+
+async function logPush(batchId, kind, n, result, error) {
+  try {
+    const ids = Object.keys(result);
+    if (!ids.length) return;
+    const counts = {};
+    for (const st of Object.values(result)) counts[st] = (counts[st] || 0) + 1;
+    await db.collection("push_log").doc(batchId).set({
+      kind,
+      origin: "auto",
+      title: String(n.title || "").slice(0, 300),
+      body: String(n.body || "").slice(0, 1000),
+      ...(n.titleEn ? { titleEn: String(n.titleEn).slice(0, 300) } : {}),
+      ...(n.bodyEn ? { bodyEn: String(n.bodyEn).slice(0, 1000) } : {}),
+      type: n.type || "general",
+      result,
+      counts,
+      total: ids.length,
+      ...(error ? { error: String(error).slice(0, 300) } : {}),
+      createdBy: "automation",
+      createdAt: FieldValue.serverTimestamp(),
+    });
+  } catch (e) {
+    console.log("push_log failed", e.message);
+  }
 }
 
 async function notify(uid, n) {
   if (!uid) return;
   try {
     const u = await db.collection("users").doc(uid).get();
-    if (u.exists && u.data().notificationsMuted === true) return;
+    if (u.exists && u.data().notificationsMuted === true) {
+      await logPush(db.collection("push_log").doc().id, "single", n, { [uid]: "muted" });
+      return;
+    }
     const ref = await db.collection("notifications").add({
       userId: uid,
       title: n.title,
@@ -86,9 +137,16 @@ async function notify(uid, n) {
       isRead: false,
       createdAt: FieldValue.serverTimestamp(),
     });
-    await pushTo({ include_aliases: { external_id: [uid] } }, n, ref.id);
+    let r;
+    try {
+      r = await pushTo({ include_aliases: { external_id: [uid] } }, n, ref.id);
+    } catch (e) {
+      await logPush(ref.id, "single", n, { [uid]: "failed" }, e.message);
+      throw e;
+    }
+    await logPush(ref.id, "single", n, { [uid]: statusFor(uid, r) }, r && r.skipped ? "missing-onesignal-secrets" : r && r.error);
   } catch (e) {
-    console.log("notify failed", uid, e.message);
+    console.log("notify failed", String(uid).slice(0, 4) + "…", e.message);
   }
 }
 
@@ -214,19 +272,40 @@ async function releaseSlot(slotId, bookingId) {
       if (p.bookingId === bookingId && typeof p.seats === "number" && p.seats > 0) freed = p.seats;
     }
     players = players.filter((p) => p.bookingId !== bookingId);
-    tx.update(ref, { bookedCount: Math.max((d.bookedCount || 0) - freed, 0), bookedPlayers: players, isOpen: true });
+    const left = Math.max((d.bookedCount || 0) - freed, 0);
+    tx.update(ref, { bookedCount: left, bookedPlayers: players, isOpen: true, ...(left === 0 ? { holdPending: false } : {}) });
   });
 }
 
-async function releaseAllSlots(b, bookingId) {
-  for (const s of selectionsOf(b)) await releaseSlot(s.slotId, bookingId);
-  if (b.category === "monthly") {
+// فهرس مواعيد المستقبل (bookingId -> معرّفات المواعيد). يُبنى مرة واحدة فقط في كل تشغيل وعند الحاجة،
+// بدل مسح كل المواعيد لكل حجز ملغى (كان يستنزف حد القراءات اليومي على Spark).
+let futureSlotsIndex = null;
+async function slotsOfBooking(bookingId) {
+  if (!futureSlotsIndex) {
+    futureSlotsIndex = new Map();
     const n = cairo();
     const today = `${n.getFullYear()}-${pad(n.getMonth() + 1)}-${pad(n.getDate())}`;
     const snap = await db.collection("available_slots").where("date", ">=", today).get();
     for (const d of snap.docs) {
-      const players = d.data().bookedPlayers || [];
-      if (players.some((p) => p.bookingId === bookingId)) await releaseSlot(d.id, bookingId);
+      for (const p of d.data().bookedPlayers || []) {
+        if (!p.bookingId) continue;
+        if (!futureSlotsIndex.has(p.bookingId)) futureSlotsIndex.set(p.bookingId, []);
+        futureSlotsIndex.get(p.bookingId).push(d.id);
+      }
+    }
+    console.log("future slots indexed:", snap.size);
+  }
+  return futureSlotsIndex.get(bookingId) || [];
+}
+
+async function releaseAllSlots(b, bookingId) {
+  const done = new Set();
+  for (const s of selectionsOf(b)) {
+    if (s.slotId && !done.has(s.slotId)) { done.add(s.slotId); await releaseSlot(s.slotId, bookingId); }
+  }
+  if (b.category === "monthly") {
+    for (const id of await slotsOfBooking(bookingId)) {
+      if (!done.has(id)) { done.add(id); await releaseSlot(id, bookingId); }
     }
   }
 }
@@ -249,11 +328,35 @@ async function expireUnpaidBookings() {
   let cancelled = 0, reminded = 0;
   for (const doc of snap.docs) {
     const b = doc.data();
+    const parent = String(b.parentId || "");
+    // رُفض إيصاله: فرصة واحدة (receiptRetryUntil) ثم يُلغى ويتحرر الموعد — دون مخالفة لأن العضو حاول السداد
+    if (b.receiptRetryUntil && typeof b.receiptRetryUntil.toMillis === "function") {
+      if (Date.now() >= b.receiptRetryUntil.toMillis()) {
+        const ok = await db.runTransaction(async (tx) => {
+          const cur = (await tx.get(doc.ref)).data();
+          if (!cur || cur.status !== "approvedAwaitingPayment") return false;
+          tx.update(doc.ref, {
+            status: "cancelled", cancelledAt: FieldValue.serverTimestamp(),
+            cancellationReason: "لم يُرفع إيصال صحيح خلال 30 دقيقة من رفض الإيصال",
+            cancellationKind: "receipt_retry_timeout", penaltyApplied: false,
+          });
+          return true;
+        });
+        if (ok) {
+          await releaseAllSlots(b, doc.id);
+          cancelled++;
+          await notify(parent, {
+            title: "❌ تم إلغاء حجزك", body: `تم إلغاء حجز ${b.sport || ""} لأنه لم يُرفع إيصال صحيح خلال المهلة بعد رفض الإيصال، وأُتيح الموعد للآخرين.`,
+            type: "cancellation", relatedId: doc.id,
+          });
+        }
+      }
+      continue;
+    }
     if (!b.approvedAt) continue;
     const win = windowMin(b);
     if (win == null) continue;
     const elapsed = (Date.now() - b.approvedAt.toMillis()) / 60000;
-    const parent = String(b.parentId || "");
 
     if (elapsed >= win) {
       const ok = await db.runTransaction(async (tx) => {
@@ -294,6 +397,25 @@ function hoursFor(kind, level) {
   return base * (1 << (l - 1));
 }
 
+// ---- قيود الحجز على جهاز الهاتف (تُنسخ مع قيد الحساب حتى لا يمحوها حذف الحساب أو فتح حساب جديد) ----
+async function mirrorRestrictionToDevices(parentId, fields, extraDeviceId) {
+  try {
+    const ids = new Set();
+    if (extraDeviceId) ids.add(String(extraDeviceId));
+    const cur = (await db.collection("restrictions").doc(parentId).get()).data() || {};
+    (cur.deviceIds || []).forEach((x) => ids.add(String(x)));
+    const bs = await db.collection("bookings").where("parentId", "==", parentId).get();
+    bs.forEach((d) => { const v = d.data().deviceId; if (v) ids.add(String(v)); });
+    if (!ids.size) return;
+    for (const id of ids) {
+      await db.collection("device_restrictions").doc(id).set(
+        { deviceId: id, parentIds: FieldValue.arrayUnion(parentId), ...fields, updatedAt: FieldValue.serverTimestamp() },
+        { merge: true });
+    }
+    await db.collection("restrictions").doc(parentId).set({ deviceIds: FieldValue.arrayUnion(...ids) }, { merge: true });
+  } catch (e) { console.log("device restriction mirror failed:", e.message); }
+}
+
 async function addStrike(b) {
   const parentId = String(b.parentId || "");
   if (!parentId) return 0;
@@ -310,16 +432,21 @@ async function addStrike(b) {
   const n = (Number(strikes[key]) || 0) + 1;
 
   if (n >= 2) {
-    delete strikes[key];
     const level = (Number(cur[`${kind}Level`]) || 0) + 1;
     const hours = hoursFor(kind, level);
-    await ref.set({
-      parentId, strikes,
+    await ref.set({ parentId }, { merge: true });
+    await ref.update({ // update() (not set+merge) so the used-up strike key is really removed
+      [`strikes.${key}`]: FieldValue.delete(),
       [`${kind}Level`]: level,
       [`${kind}Until`]: Timestamp.fromDate(new Date(Date.now() + hours * 3600000)),
       [`${kind}Auto`]: true,
       updatedAt: FieldValue.serverTimestamp(),
-    }, { merge: true });
+    });
+    await mirrorRestrictionToDevices(parentId, {
+      [`${kind}Level`]: level,
+      [`${kind}Until`]: Timestamp.fromDate(new Date(Date.now() + hours * 3600000)),
+      [`${kind}Auto`]: true,
+    }, b.deviceId);
     const days = hours >= 48 ? `${Math.round(hours / 24)} يوم` : `${hours} ساعة`;
     const daysEn = hours >= 48 ? `${Math.round(hours / 24)} days` : `${hours} hours`;
     await notify(parentId, {
@@ -334,8 +461,8 @@ async function addStrike(b) {
     });
     return 1;
   }
-  strikes[key] = n;
-  await ref.set({ parentId, strikes, updatedAt: FieldValue.serverTimestamp() }, { merge: true });
+  await ref.set({ parentId }, { merge: true });
+  await ref.update({ [`strikes.${key}`]: n, updatedAt: FieldValue.serverTimestamp() });
   return 0;
 }
 
@@ -386,29 +513,88 @@ function summaryOf(b) {
   return sels.map((s) => `${DAY_AR[s.dayOfWeek] || ""} ${s.startTime || ""}`.trim()).join("، ");
 }
 
+// تبديل المدربين (coach_swaps): المدرب البديل يحل مكان الأصلي ليوم بتاريخ أو يوم أسبوعي باستمرار
+let _swapCache = null;
+async function activeSwapRules() {
+  if (_swapCache && Date.now() - _swapCache.t < 60000) return _swapCache.v;
+  let v = [];
+  try {
+    const s = await db.collection("coach_swaps").where("active", "==", true).get();
+    v = s.docs.map((d) => ({ ...d.data(), id: d.id }));
+  } catch (e) {
+    console.log("coach_swaps read failed:", e.message);
+  }
+  _swapCache = { t: Date.now(), v };
+  return v;
+}
+function swapFor(rules, coachId, dateStr, branch) {
+  if (!coachId) return null;
+  const wd = new Date(dateStr + "T00:00:00Z").getUTCDay() || 7; // 1=الإثنين .. 7=الأحد (مثل Dart)
+  const b = branch || "sixth";
+  for (const r of rules) {
+    if (r.fromCoachId !== coachId) continue;
+    const rb = r.branch || "all";
+    if (rb !== "all" && rb !== b) continue;
+    if ((r.scope || "date") === "date") { if (r.date === dateStr) return r; continue; }
+    if (Number(r.weekday) !== wd) continue;
+    if (r.startDate && dateStr < r.startDate) continue;
+    return r;
+  }
+  return null;
+}
+
+// هل هذا الموعد لنفس المدرب؟ (قد يحمل مدرباً بديلاً ليوم واحد وعندها يبقى المدرب الأصلي في origCoachId)
+function sameCoachSlot(d, coachId, coachName) {
+  const id = String(coachId || "").trim();
+  const name = String(coachName || "").trim();
+  if (!id && !name) return true;
+  if (id) {
+    const sid = String(d.coachId || "");
+    const oid = String(d.origCoachId || "");
+    if (sid === id || oid === id) return true;
+    return !sid && !!name && String(d.coachName || "") === name;
+  }
+  return String(d.coachName || "") === name || String(d.origCoachName || "") === name;
+}
+
 async function reserveOrCreateSlot(p) {
-  const existing = await db.collection("available_slots")
-    .where("date", "==", p.date).where("startTime", "==", p.startTime).where("branch", "==", p.branch)
-    .limit(1).get();
-  if (existing.empty) {
+  // كان يأخذ أول موعد بنفس الوقت أياً كان مدربه (فيقع اللاعب عند مدرب آخر أو يُتخطّى الأسبوع بصمت)
+  const snap = await db.collection("available_slots")
+    .where("date", "==", p.date).where("startTime", "==", p.startTime).get();
+  // الفرع يُقارن هنا: المواعيد القديمة بلا حقل فرع تتبع الفرع الافتراضي
+  const all = snap.docs.filter((d) => (d.data().branch || "sixth") === p.branch);
+  for (const d of all) {
+    if ((d.data().bookedPlayers || []).some((x) => x && x.bookingId === p.bookingId)) return d.id; // محجوز لنفس الحجز
+  }
+  const mine = all.filter((d) => sameCoachSlot(d.data(), p.coachId, p.coachName));
+  if (!mine.length) {
+    const sw = swapFor(await activeSwapRules(), p.coachId, p.date, p.branch);
     const ref = await db.collection("available_slots").add({
       sport: p.sport, bookingType: p.bookingType, branch: p.branch, date: p.date,
-      startTime: p.startTime, endTime: p.endTime, coachId: p.coachId ?? null, coachName: p.coachName ?? null,
+      startTime: p.startTime, endTime: p.endTime,
+      coachId: sw ? sw.toCoachId : (p.coachId ?? null), coachName: sw ? sw.toCoachName : (p.coachName ?? null),
+      ...(sw ? { swapId: sw.id, origCoachId: p.coachId, origCoachName: p.coachName ?? sw.fromCoachName ?? null } : {}),
       court: p.court ?? "", capacity: 1, bookedCount: 1,
-      bookedPlayers: [{ playerId: p.playerId ?? null, playerName: p.playerName ?? null, bookingId: p.bookingId }],
+      bookedPlayers: [{ playerId: p.playerId ?? null, playerName: p.playerName ?? null, bookingId: p.bookingId, category: "monthly" }],
       isOpen: false, reservedByMonthly: true, createdAt: FieldValue.serverTimestamp(),
     });
     return ref.id;
   }
-  const doc = existing.docs[0];
-  await db.runTransaction(async (tx) => {
-    const d = (await tx.get(doc.ref)).data();
-    const cap = d.capacity ?? 1, booked = d.bookedCount ?? 0;
-    if (booked >= cap) throw new Error("slot-full");
-    const players = [...(d.bookedPlayers || []), { playerId: p.playerId ?? null, playerName: p.playerName ?? null, bookingId: p.bookingId }];
-    tx.update(doc.ref, { bookedCount: booked + 1, bookedPlayers: players, ...(booked + 1 >= cap ? { isOpen: false } : {}) });
-  });
-  return doc.id;
+  for (const doc of mine) {
+    try {
+      await db.runTransaction(async (tx) => {
+        const d = (await tx.get(doc.ref)).data();
+        const cap = d.capacity ?? 1, booked = d.bookedCount ?? 0;
+        if (booked >= cap) throw new Error("slot-full");
+        const players = [...(d.bookedPlayers || []), { playerId: p.playerId ?? null, playerName: p.playerName ?? null, bookingId: p.bookingId, category: "monthly" }];
+        tx.update(doc.ref, { bookedCount: booked + 1, bookedPlayers: players, ...(booked + 1 >= cap ? { isOpen: false } : {}) });
+      });
+      return doc.id;
+    } catch (e) {
+      if (e.message !== "slot-full") throw e;
+    }
+  }
+  throw new Error("slot-full");
 }
 
 async function createNextCycleBooking(doc, anchor, nextMonth, holdEnd) { // يعيد true لو أنشأ حجزًا جديدًا
@@ -422,16 +608,19 @@ async function createNextCycleBooking(doc, anchor, nextMonth, holdEnd) { // يع
     const orig = cairo(s.firstDate.toDate());
     let t = new Date(anchor.getFullYear(), anchor.getMonth(), 1);
     while (t.getDay() !== orig.getDay()) t = new Date(t.getFullYear(), t.getMonth(), t.getDate() + 1);
+    // الاشتراك الواحد قد يجمع مواعيد من أكثر من فرع: لكل موعد فرعه، وإلا فرع الحجز
+    const sBranch = s.branch || b.branch || "sixth";
     try {
       const slotId = await reserveOrCreateSlot({
         date: ymd(t), startTime: s.startTime || "", endTime: s.endTime || "",
-        sport: b.sport || "Squash", bookingType: b.type || "program", branch: b.branch || "sixth",
+        sport: b.sport || "Squash", bookingType: b.type || "program", branch: sBranch,
         coachId: s.coachId, coachName: s.coachName, court: s.court,
         playerId: b.playerId, playerName: b.playerName, bookingId: ref.id,
       });
       out.push({
         dayOfWeek: t.getDay() || 7, startTime: s.startTime ?? null, endTime: s.endTime ?? null,
         coachId: s.coachId ?? null, coachName: s.coachName ?? null, court: s.court ?? null,
+        branch: sBranch,
         slotId, firstDate: Timestamp.fromDate(cairoMidnight(t)),
       });
     } catch (e) { console.log("slot skipped:", doc.id, e.message); }
@@ -442,6 +631,7 @@ async function createNextCycleBooking(doc, anchor, nextMonth, holdEnd) { // يع
     sport: b.sport ?? null, branch: b.branch || "sixth", type: b.type ?? null,
     category: "monthly", isGroupBooking: true, selections: out,
     programId: b.programId ?? null, programName: b.programName ?? null,
+    ...(b.isExtra === true ? { isExtra: true } : {}),
     status: "awaitingConfirmation", isAdminApproved: false,
     cycleMonth: nextMonth, cycleSourceId: doc.id, createdAt: FieldValue.serverTimestamp(),
   });
@@ -466,18 +656,33 @@ async function cancelIfStatus(ref, statuses, reason) {
 async function broadcastAll(n) {
   const users = await db.collection("users").get();
   const ids = users.docs.filter((d) => d.data().notificationsMuted !== true).map((d) => d.id);
+  const batchId = db.collection("push_log").doc().id;
+  const result = {};
+  for (const d of users.docs) if (d.data().notificationsMuted === true) result[d.id] = "muted";
+  let firstError = "";
   for (let i = 0; i < ids.length; i += 400) {
+    const chunk = ids.slice(i, i + 400);
     const batch = db.batch();
-    for (const id of ids.slice(i, i + 400)) {
+    for (const id of chunk) {
       batch.set(db.collection("notifications").doc(), {
-        userId: id, title: n.title, body: n.body, titleEn: n.titleEn, bodyEn: n.bodyEn,
+        userId: id, batchId, title: n.title, body: n.body, titleEn: n.titleEn, bodyEn: n.bodyEn,
         type: n.type || "general", relatedId: null, viaRelay: true, isRead: false,
         createdAt: FieldValue.serverTimestamp(),
       });
     }
     await batch.commit();
+    let r;
+    try {
+      r = await pushTo({ include_aliases: { external_id: chunk } }, n, "");
+    } catch (e) {
+      for (const id of chunk) result[id] = "failed";
+      await logPush(batchId, "group", n, result, e.message);
+      throw e;
+    }
+    for (const id of chunk) result[id] = statusFor(id, r);
+    if (!firstError && r && (r.skipped || r.error)) firstError = r.skipped ? "missing-onesignal-secrets" : r.error;
   }
-  await pushTo({ included_segments: ["Total Subscriptions"] }, n, "");
+  await logPush(batchId, "group", n, result, firstError);
 }
 
 const PHASE_MSG = {
@@ -494,6 +699,7 @@ const PHASE_MSG = {
 };
 
 async function runMonthlyCycle() {
+  futureSlotsIndex = null; // قد تُنشأ مواعيد جديدة أثناء هذا التشغيل
   const raw = (await db.collection("system_settings").doc("academy_config").get()).data() || {};
   const dayCfg = (v, f) => {
     const n = typeof v === "number" ? Math.trunc(v) : parseInt(v, 10);
@@ -901,7 +1107,8 @@ async function applyDecision(doc) {
       sport: String(o.sport || ""), branch: String(o.branch || ""),
       coachDocId: String(o.coachDocId || ""), coachName: String(o.coachName || ""),
       startTime: String(o.startTime || ""), endTime: String(o.endTime || ""),
-      toDate: null, toStartTime: null, toEndTime: null, toCoachDocId: "", toCoachName: null,
+      toDate: String(o.date || ""), toStartTime: String(o.startTime || ""), toEndTime: String(o.endTime || ""),
+      toCoachDocId: String(o.coachDocId || ""), toCoachName: String(o.coachName || ""),
       note: "بديل بالنقاط", inParentId: "", createdAt: FieldValue.serverTimestamp(),
     });
     tx.update(doc.ref, { status: "done", doneAt: FieldValue.serverTimestamp() });
@@ -924,6 +1131,269 @@ async function sweepReplacements() {
   await buildPendingOffers();
   await openExpiredHolds();
   await applyReplacementDecisions();
+}
+
+// ---------- 7) إشعار جدول المدرب اليومي (6 صباحًا بتوقيت القاهرة، مرة واحدة يوميًا لكل مدرب) ----------
+async function coachDailyNotice() {
+  const now = cairo();
+  if (now.getHours() < 6) return;
+  const today = ymd(now);
+  const ref = db.collection("system_settings").doc("server_state");
+  const st = (await ref.get()).data() || {};
+  const fresh = st.coachNoticeDate !== today;
+  const done = new Set(fresh ? [] : (st.coachNoticeDone || []));
+  const coaches = await db.collection("users").where("role", "==", "coach").get();
+  if (coaches.docs.every((u) => done.has(u.id))) return;
+  if (fresh) await ref.set({ coachNoticeDate: today, coachNoticeDone: [] }, { merge: true });
+  let sent = 0;
+  for (const u of coaches.docs) {
+    if (done.has(u.id)) continue;
+    const coachDocId = u.data().coachDocId;
+    if (!coachDocId) { await ref.update({ coachNoticeDone: FieldValue.arrayUnion(u.id) }); continue; }
+    const lines = [];
+    (await db.collection("available_slots").where("coachId", "==", coachDocId).where("date", "==", today).get())
+      .forEach((s) => { const d = s.data(); (d.bookedPlayers || []).forEach((p) => lines.push({ start: d.startTime, player: p.playerName, playerId: p.playerId })); });
+    const dropped = new Set(), extra = [];
+    let changes = 0;
+    (await db.collection("daily_overrides").where("coachDocId", "==", coachDocId).where("date", "==", today).get()).forEach((o) => {
+      const d = o.data();
+      if (["excuse", "cancel", "move", "replace"].includes(d.type)) { dropped.add(`${d.playerId}|${d.startTime}`); changes++; }
+      if (d.type === "replace" && d.inPlayerName) extra.push({ start: d.startTime, player: d.inPlayerName });
+    });
+    (await db.collection("daily_overrides").where("toCoachDocId", "==", coachDocId).where("toDate", "==", today).get()).forEach((o) => {
+      const d = o.data();
+      if (["move", "add"].includes(d.type)) { extra.push({ start: d.toStartTime || d.startTime, player: d.playerName }); changes++; }
+    });
+    const active = [...lines.filter((l) => !dropped.has(`${l.playerId}|${l.start}`)), ...extra]
+      .sort((a, b) => minutesOf(a.start) - minutesOf(b.start));
+    await ref.update({ coachNoticeDone: FieldValue.arrayUnion(u.id) }); // نعلّم هذا المدرب فقط قبل الإرسال
+    if (!active.length) continue;
+    const summary = active.slice(0, 6).map((l) => `${l.start} - ${l.player}`).join("\n");
+    await notify(u.id, {
+      title: "جدول تدريب اليوم متاح",
+      body: `لديك ${active.length} حصة اليوم (${today}).\n${summary}${changes ? `\n(يتضمن ${changes} تعديل لهذا اليوم)` : ""}`,
+      type: "schedule",
+    });
+    sent++;
+  }
+  console.log("coach daily notices sent:", sent);
+}
+
+// ---------- 8) تذكير اللاعبين / أولياء الأمور بحصص اليوم ----------
+const REMIND_FROM_HOUR = 7;      // أول إشعار صباحي (7 ص بتوقيت القاهرة)
+const REMIND_UNTIL_HOUR = 22;
+const REMIND_BEFORE_MIN = 120;   // تذكير قبل الحصة بساعتين
+const REMIND_SKIP_IF_MORNING_WITHIN_MIN = 150; // لا تذكير ثانٍ لو وصل الصباحي قبل أقل من ساعتين ونصف
+const REMIND_SCAN_EVERY_MIN = 10; // لا يُمسح جدول اليوم أكثر من مرة كل 10 دقائق (توفير قراءات Firestore)
+const safeKey = (k) => String(k).replace(/[^A-Za-z0-9_]/g, "_");
+const fmtClock = (mins) => `${pad(Math.floor(mins / 60) % 24)}:${pad(mins % 60)}`;
+
+async function memberSessionReminders() {
+  const now = cairo();
+  const hour = now.getHours();
+  if (hour < REMIND_FROM_HOUR || hour >= REMIND_UNTIL_HOUR) return;
+  const nowMin = hour * 60 + now.getMinutes();
+  const today = ymd(now);
+  const stRef = db.collection("automation_state").doc(`reminders_${today}`);
+  const st = (await stRef.get()).data() || {};
+  if (st.scanAt && Date.now() - st.scanAt < REMIND_SCAN_EVERY_MIN * 60000) return;
+  if (typeof st.lastStart === "number" && nowMin > st.lastStart) return; // انتهت كل حصص اليوم
+  const sent = st.sent || {};
+
+  const entries = new Map(); // `${playerId}|${startMin}` -> حصة
+  const dropped = new Set();
+  const ovs = new Map();
+  for (const snap of [
+    await db.collection("daily_overrides").where("date", "==", today).get(),
+    await db.collection("daily_overrides").where("toDate", "==", today).get(),
+  ]) snap.forEach((d) => ovs.set(d.id, d.data()));
+
+  for (const o of ovs.values()) {
+    if (o.date === today && o.playerId && ["excuse", "cancel", "move", "replace"].includes(o.type)) {
+      dropped.add(`${o.playerId}|${minutesOf(o.startTime)}`);
+    }
+  }
+
+  const slots = await db.collection("available_slots").where("date", "==", today).get();
+  for (const s of slots.docs) {
+    const d = s.data();
+    const start = minutesOf(d.startTime);
+    for (const p of d.bookedPlayers || []) {
+      if (!p.playerId) continue;
+      const k = `${p.playerId}|${start}`;
+      if (dropped.has(k) || entries.has(k)) continue;
+      entries.set(k, {
+        playerId: String(p.playerId), playerName: p.playerName || "", bookingId: String(p.bookingId || ""),
+        start, startTime: d.startTime || "", sport: d.sport || "", coachName: d.coachName || "", parentId: "",
+      });
+    }
+  }
+  // حصص أُضيفت/نُقلت/استُبدلت لهذا اليوم (لها parentId جاهز)
+  for (const o of ovs.values()) {
+    const isReplace = o.type === "replace";
+    const targetDate = o.toDate || (o.type === "add" || isReplace ? o.date : "");
+    if (targetDate !== today || !["add", "move", "replace"].includes(o.type)) continue;
+    const pid = String((isReplace ? o.inPlayerId : o.playerId) || "");
+    if (!pid) continue;
+    const st0 = o.toStartTime || o.startTime || "";
+    const start = minutesOf(st0);
+    const k = `${pid}|${start}`;
+    if (entries.has(k)) continue;
+    entries.set(k, {
+      playerId: pid, playerName: (isReplace ? o.inPlayerName : o.playerName) || "", bookingId: "",
+      start, startTime: st0, sport: o.sport || "", coachName: o.toCoachName || o.coachName || "",
+      parentId: String((isReplace ? o.inParentId : o.parentId) || ""),
+    });
+  }
+
+  const upcoming = [...entries.values()].filter((e) => e.start > nowMin);
+  const lastStart = Math.max(0, ...[...entries.values()].map((e) => e.start));
+  const wantMorning = (e) => !sent[safeKey(`m_${e.playerId}_${e.start}`)];
+  const wantBefore = (e) => !sent[safeKey(`r_${e.playerId}_${e.start}`)] && e.start - nowMin <= REMIND_BEFORE_MIN;
+  const todo = upcoming.filter((e) => wantMorning(e) || wantBefore(e));
+
+  if (todo.length) {
+    // 1) parentId للحصص القادمة من الجدول الثابت (من ملف اللاعب)
+    const needParent = [...new Set(todo.filter((e) => !e.parentId).map((e) => e.playerId))];
+    const parentOf = new Map();
+    for (let i = 0; i < needParent.length; i += 30) {
+      const refs = needParent.slice(i, i + 30).map((id) => db.collection("players").doc(id));
+      for (const d of await db.getAll(...refs)) if (d.exists) parentOf.set(d.id, String(d.data().parentId || ""));
+    }
+    // 2) لا تذكير إلا لحجز مؤكد (أو إيصاله قيد المراجعة)؛ المعلّق/الملغى يُستبعد
+    const bookingIds = [...new Set(todo.map((e) => e.bookingId).filter((id) => id && !id.startsWith("repl_")))];
+    const okBooking = new Set();
+    for (let i = 0; i < bookingIds.length; i += 30) {
+      const refs = bookingIds.slice(i, i + 30).map((id) => db.collection("bookings").doc(id));
+      for (const d of await db.getAll(...refs)) {
+        if (d.exists && ["confirmed", "paymentSubmitted"].includes(d.data().status)) okBooking.add(d.id);
+      }
+    }
+    const valid = todo.filter((e) => {
+      if (!e.parentId) e.parentId = parentOf.get(e.playerId) || "";
+      if (!e.parentId) return false;
+      return !e.bookingId || e.bookingId.startsWith("repl_") || okBooking.has(e.bookingId);
+    });
+
+    // سجّل أولًا ثم أرسل: لا يتكرر الإشعار أبدًا
+    const marks = {};
+    const byParentMorning = new Map();
+    for (const e of valid) {
+      if (wantMorning(e)) {
+        marks[safeKey(`m_${e.playerId}_${e.start}`)] = Date.now();
+        if (!byParentMorning.has(e.parentId)) byParentMorning.set(e.parentId, []);
+        byParentMorning.get(e.parentId).push(e);
+      }
+    }
+    const before = [];
+    for (const e of valid) {
+      if (!wantBefore(e)) continue;
+      marks[safeKey(`r_${e.playerId}_${e.start}`)] = Date.now();
+      const morningAt = sent[safeKey(`pm_${e.parentId}`)];
+      const justToldMorning = byParentMorning.has(e.parentId) || (morningAt && Date.now() - morningAt < REMIND_SKIP_IF_MORNING_WITHIN_MIN * 60000);
+      if (!justToldMorning && e.start - nowMin >= 15) before.push(e);
+    }
+    for (const pid of byParentMorning.keys()) marks[safeKey(`pm_${pid}`)] = Date.now();
+    // الحصص التي فات وقت إشعارها تُعلَّم أيضًا فلا تُعاد قراءتها كل مرة
+    for (const e of entries.values()) {
+      if (e.start <= nowMin) { marks[safeKey(`m_${e.playerId}_${e.start}`)] = 1; marks[safeKey(`r_${e.playerId}_${e.start}`)] = 1; }
+    }
+    if (Object.keys(marks).length) await stRef.set({ sent: marks }, { merge: true });
+
+    for (const [parent, list] of byParentMorning) {
+      list.sort((a, b) => a.start - b.start);
+      const ar = list.map((e) => `• ${e.playerName || "اللاعب"} — ${fmtClock(e.start)}${e.sport ? ` (${SPORT_AR[e.sport] || e.sport})` : ""}${e.coachName ? ` مع ${e.coachName}` : ""}`).join("\n");
+      const en = list.map((e) => `• ${e.playerName || "Player"} — ${fmtClock(e.start)}${e.sport ? ` (${e.sport})` : ""}${e.coachName ? ` with ${e.coachName}` : ""}`).join("\n");
+      await notify(parent, {
+        title: list.length > 1 ? `📅 لديك ${list.length} حصص تدريب اليوم` : "📅 لديك حصة تدريب اليوم",
+        titleEn: list.length > 1 ? `📅 You have ${list.length} training sessions today` : "📅 You have a training session today",
+        body: `${ar}\nنراك في الموعد، وإذا تعذّر الحضور فاعتذر مبكرًا من التطبيق.`,
+        bodyEn: `${en}\nSee you there — if you cannot attend, please apologize early from the app.`,
+        type: "schedule",
+      });
+    }
+    for (const e of before) {
+      const diff = e.start - nowMin;
+      const whenAr = diff >= 100 ? "بعد ساعتين تقريبًا" : `بعد ${diff} دقيقة`;
+      const whenEn = diff >= 100 ? "in about 2 hours" : `in ${diff} minutes`;
+      await notify(e.parentId, {
+        title: "⏰ تذكير بحصة التدريب", titleEn: "⏰ Training reminder",
+        body: `تبدأ حصة ${e.playerName || "اللاعب"} الساعة ${fmtClock(e.start)} (${whenAr})${e.coachName ? ` مع ${e.coachName}` : ""}.`,
+        bodyEn: `${e.playerName || "Player"}'s session starts at ${fmtClock(e.start)} (${whenEn})${e.coachName ? ` with ${e.coachName}` : ""}.`,
+        type: "schedule",
+      });
+    }
+    console.log("session reminders — morning:", byParentMorning.size, "before:", before.length);
+  }
+  await stRef.set({ scanAt: Date.now(), lastStart }, { merge: true });
+}
+
+// ---------- حذف حسابات الدخول نهائياً ----------
+// الأدمن يحذف العضو من التطبيق فيُكتب طلب في deleted_accounts؛ هنا يُحذف حساب الدخول نفسه (Firebase Authentication) ثم يُمسح الطلب،
+// فلا يبقى أي أثر ويمكن تسجيل نفس الرقم من جديد. (التطبيق نفسه لا يستطيع حذف حساب دخول شخص آخر.)
+async function purgeDeletedAuthUsers() {
+  const snap = await db.collection("deleted_accounts").limit(50).get();
+  if (snap.empty) return;
+  let done = 0;
+  for (const d of snap.docs) {
+    const uid = d.id;
+    try {
+      // أمان: لا يُحذف حساب أدمن أبداً حتى لو وصل طلب بالخطأ
+      const prof = await db.collection("users").doc(uid).get();
+      if (prof.exists && prof.data().role === "admin") { await d.ref.delete(); continue; }
+    } catch (_) {}
+    let ok = true;
+    try { await admin.auth().deleteUser(uid); }
+    catch (e) {
+      if (e.code !== "auth/user-not-found") { ok = false; console.error("auth purge failed:", uid, e.code || e.message); }
+    }
+    if (ok) { await d.ref.delete(); done++; }
+  }
+  console.log("auth accounts purged:", done);
+}
+
+// ---------- فحص الحسابات (عند الطلب فقط) ----------
+// يقارن حسابات الدخول (Authentication) بملفات الأعضاء في التطبيق ويكتب التقرير في admin_tools/auth_audit_report.
+// يعمل فقط عندما يضغط الأدمن «فحص الآن» حتى لا يستهلك قراءات Firestore كل 5 دقائق.
+async function auditAuthUsers() {
+  const reqRef = db.collection("admin_tools").doc("auth_audit_request");
+  const req = await reqRef.get();
+  if (!req.exists || req.data().status !== "pending") return;
+
+  const authUsers = [];
+  let token;
+  do {
+    const page = await admin.auth().listUsers(1000, token);
+    authUsers.push(...page.users);
+    token = page.pageToken;
+  } while (token);
+
+  const profSnap = await db.collection("users").select("fullName", "name", "phone", "role", "email").get();
+  const profiles = new Map(profSnap.docs.map((d) => [d.id, d.data()]));
+  const authIds = new Set(authUsers.map((u) => u.uid));
+  const GRACE_MS = 2 * 3600 * 1000; // من أنشأ حسابه قبل ساعتين فقط قد يكون يكمل التسجيل الآن
+  const now = Date.now();
+  const ms = (t) => (t ? new Date(t).getTime() : 0);
+
+  const authOnlyAll = authUsers
+    .filter((u) => !profiles.has(u.uid) && now - ms(u.metadata.creationTime) > GRACE_MS)
+    .map((u) => ({ uid: u.uid, email: u.email || "", phone: u.phoneNumber || "", createdAt: ms(u.metadata.creationTime), lastSignInAt: ms(u.metadata.lastSignInTime) }))
+    .sort((a, b) => a.createdAt - b.createdAt);
+  const appOnlyAll = [...profiles.entries()]
+    .filter(([id]) => !authIds.has(id))
+    .map(([id, p]) => ({ uid: id, name: p.fullName || p.name || "", phone: p.phone || "", role: p.role || "", email: p.email || "" }));
+
+  const LIMIT = 300;
+  await db.collection("admin_tools").doc("auth_audit_report").set({
+    generatedAt: FieldValue.serverTimestamp(),
+    authCount: authUsers.length,
+    usersCount: profiles.size,
+    authOnly: authOnlyAll.slice(0, LIMIT),
+    appOnly: appOnlyAll.slice(0, LIMIT),
+    truncated: authOnlyAll.length > LIMIT || appOnlyAll.length > LIMIT,
+  });
+  await reqRef.set({ status: "done", doneAt: FieldValue.serverTimestamp() }, { merge: true });
+  console.log("auth audit:", authUsers.length, "auth accounts,", profiles.size, "profiles,", authOnlyAll.length, "without profile,", appOnlyAll.length, "without sign-in");
 }
 
 async function withRetry(job, tries = 3) {
@@ -955,9 +1425,163 @@ async function checkMode() {
   console.log("=== انتهى الفحص بنجاح ✅ ===");
 }
 
+// ---------- 9) تقييم الحصص: إشعار للمدرب بعد كل حصة + تذكير نهاية اليوم ----------
+// المفتاح نفسه في التطبيق (EvalGate.keyOf) — لا تغيّر الصيغة في أحد الطرفين فقط.
+const EVAL_EOD_GRACE_MIN = 30;   // نهاية اليوم = بعد آخر حصة للمدرب بنصف ساعة (نفس ثابت التطبيق)
+const EVAL_RESCAN_MIN = 60;      // إعادة فحص دورية لالتقاط تعديلات الجدول المتأخرة
+const evalKey = (date, start, playerId) => {
+  const t = minutesOf(start);
+  return `${date}_${pad(Math.floor(t / 60))}${pad(t % 60)}_${String(playerId).replace(/[^A-Za-z0-9]/g, "_")}`;
+};
+
+// حصص المدرب الفعلية لهذا اليوم بعد التعديلات (اعتذار/إلغاء/نقل/استبدال لاعب لهذا اليوم)
+async function coachTodaySessions(coachDocId, today) {
+  const ovs = new Map();
+  for (const snap of [
+    await db.collection("daily_overrides").where("coachDocId", "==", coachDocId).where("date", "==", today).get(),
+    await db.collection("daily_overrides").where("toCoachDocId", "==", coachDocId).where("toDate", "==", today).get(),
+    await db.collection("daily_overrides").where("coachDocId", "==", coachDocId).where("toDate", "==", today).get(),
+  ]) snap.forEach((d) => ovs.set(d.id, d.data()));
+
+  const dropped = new Set();
+  for (const o of ovs.values()) {
+    if (o.date === today && o.playerId && ["excuse", "cancel", "move", "replace"].includes(o.type)) {
+      dropped.add(`${o.playerId}|${minutesOf(o.startTime)}`);
+    }
+  }
+  const out = new Map();
+  const add = (s) => {
+    const startMin = minutesOf(s.startTime);
+    let endMin = s.endTime ? minutesOf(s.endTime) : 0;
+    if (endMin <= startMin) endMin = startMin + 60;
+    const key = evalKey(today, s.startTime, s.playerId);
+    if (!out.has(key)) out.set(key, { ...s, startMin, endMin, key });
+  };
+  const slots = await db.collection("available_slots").where("coachId", "==", coachDocId).where("date", "==", today).get();
+  for (const sl of slots.docs) {
+    const d = sl.data();
+    for (const p of d.bookedPlayers || []) {
+      if (!p.playerId) continue;
+      if (dropped.has(`${p.playerId}|${minutesOf(d.startTime)}`)) continue;
+      add({ playerId: String(p.playerId), playerName: p.playerName || "", startTime: d.startTime || "", endTime: d.endTime || "", sport: d.sport || "" });
+    }
+  }
+  // حصص نُقلت/أُضيفت/حلّ فيها لاعب بديل لهذا اليوم → اللاعب الذي يتدرب فعلًا هو من يُقيَّم
+  for (const o of ovs.values()) {
+    if (!["add", "move", "replace"].includes(o.type)) continue;
+    const isRepl = o.type === "replace";
+    const target = o.toDate || (o.type === "add" || isRepl ? o.date : "");
+    if (target !== today) continue;
+    if (o.toCoachDocId && o.toCoachDocId !== coachDocId) continue; // نُقلت لمدرب آخر
+    const pid = String((isRepl ? o.inPlayerId : o.playerId) || "");
+    if (!pid) continue;
+    add({
+      playerId: pid, playerName: (isRepl ? o.inPlayerName : o.playerName) || "",
+      startTime: o.toStartTime || o.startTime || "", endTime: o.toEndTime || o.endTime || "", sport: o.sport || "",
+    });
+  }
+  return [...out.values()].sort((a, b) => a.startMin - b.startMin);
+}
+
+async function coachEvaluationPrompts() {
+  const now = cairo();
+  const hour = now.getHours();
+  if (hour < 7) return;
+  const nowMin = hour * 60 + now.getMinutes();
+  const today = ymd(now);
+  const stRef = db.collection("automation_state").doc(`evalprompts_${today}`);
+  const st = (await stRef.get()).data() || {};
+  // لا فحص إلا عند انتهاء حصة (أو نهاية اليوم) أو كل ساعة كحد أقصى
+  if (st.scanAt && Date.now() - st.scanAt < EVAL_RESCAN_MIN * 60000 && typeof st.nextEndMin === "number" && nowMin < st.nextEndMin) return;
+  const cfg = (await db.collection("system_settings").doc("academy_config").get()).data() || {};
+  if (cfg.evalMandatory === false) return;
+
+  const sent = st.sent || {};
+  const coaches = await db.collection("users").where("role", "==", "coach").get();
+  let nextEnd = Infinity;
+  const jobs = [];
+  for (const u of coaches.docs) {
+    const coachDocId = u.data().coachDocId;
+    if (!coachDocId) continue;
+    const sessions = await coachTodaySessions(coachDocId, today);
+    if (!sessions.length) continue;
+    const ledger = ((await db.collection("coach_eval_state").doc(u.id).get()).data() || {}).done || {};
+    const eodAt = Math.max(...sessions.map((s) => s.endMin)) + EVAL_EOD_GRACE_MIN;
+    for (const s of sessions) if (s.endMin > nowMin) nextEnd = Math.min(nextEnd, s.endMin);
+    if (eodAt > nowMin) nextEnd = Math.min(nextEnd, eodAt);
+
+    const ended = sessions.filter((s) => s.endMin <= nowMin);
+    const unevaluated = ended.filter((s) => !ledger[s.key]);
+    const fresh = unevaluated.filter((s) => !sent[safeKey(`p_${s.key}`)]);
+    if (!fresh.length) {
+      // نهاية اليوم والتقييمات ما زالت ناقصة → تذكير واحد
+      if (nowMin >= eodAt && unevaluated.length && !sent[safeKey(`eod_${u.id}`)]) {
+        jobs.push({ uid: u.id, marks: { [safeKey(`eod_${u.id}`)]: Date.now() }, msg: eodMessage(unevaluated, today) });
+      }
+      continue;
+    }
+    const marks = {};
+    for (const s of fresh) marks[safeKey(`p_${s.key}`)] = Date.now();
+    if (nowMin >= eodAt) {
+      marks[safeKey(`eod_${u.id}`)] = Date.now();
+      jobs.push({ uid: u.id, marks, msg: eodMessage(unevaluated, today) });
+      continue;
+    }
+    const groups = new Map(); // حصة واحدة (نفس الوقت) = إشعار واحد
+    for (const s of fresh) { if (!groups.has(s.startMin)) groups.set(s.startMin, []); groups.get(s.startMin).push(s); }
+    const list = [...groups.values()];
+    if (list.length > 3) {
+      jobs.push({ uid: u.id, marks, msg: eodMessage(fresh, today, true) });
+    } else {
+      list.forEach((g, i) => jobs.push({ uid: u.id, marks: i === 0 ? marks : {}, msg: sessionMessage(g) }));
+    }
+  }
+  // سجّل أولًا ثم أرسل: لا يتكرر الإشعار أبدًا
+  const allMarks = {};
+  for (const j of jobs) Object.assign(allMarks, j.marks);
+  await stRef.set({ sent: allMarks, scanAt: Date.now(), nextEndMin: Number.isFinite(nextEnd) ? nextEnd : 1e9 }, { merge: true });
+  for (const j of jobs) await notify(j.uid, j.msg);
+  console.log("coach evaluation prompts sent:", jobs.length);
+}
+
+function sessionMessage(group) {
+  const first = group[0];
+  const sport = SPORT_AR[first.sport] || first.sport || "";
+  if (group.length === 1) {
+    return {
+      title: `قيّم اللاعب: ${first.playerName}`, titleEn: `Evaluate player: ${first.playerName}`,
+      body: `انتهت حصة ${first.startTime}${sport ? ` (${sport})` : ""}. اضغط لتقييمه الآن.`,
+      bodyEn: `The ${first.startTime} session has ended. Tap to evaluate now.`,
+      type: "evaluation", relatedId: first.key, action: "evaluate",
+    };
+  }
+  const names = group.slice(0, 4).map((s) => s.playerName).join("، ");
+  return {
+    title: `قيّم لاعبي حصة ${first.startTime} (${group.length})`, titleEn: `Evaluate the ${first.startTime} session (${group.length})`,
+    body: `انتهت الحصة. اللاعبون: ${names}. اضغط للتقييم الآن.`,
+    bodyEn: `The session has ended. Tap to evaluate your players now.`,
+    type: "evaluation", relatedId: first.key, action: "evaluate",
+  };
+}
+
+function eodMessage(list, today, soft) {
+  const n = list.length;
+  return {
+    title: soft ? `لديك ${n} تقييمات جديدة` : "أكمل تقييمات اليوم",
+    titleEn: soft ? `You have ${n} new evaluations` : "Finish today's evaluations",
+    body: soft
+      ? `انتهت عدة حصص. اضغط لتقييم اللاعبين.`
+      : `بقي ${n} تقييم لحصص انتهت. أكملها الآن، وإلا يُحجب جدولك حتى تكتمل.`,
+    bodyEn: soft
+      ? `Several sessions have ended. Tap to evaluate your players.`
+      : `${n} evaluation(s) left for finished sessions. Finish them now or your schedule stays hidden until done.`,
+    type: "evaluation", relatedId: list[0].key, action: "evaluate",
+  };
+}
+
 (async () => {
   if (process.env.MODE === "check") { await checkMode(); return; }
-  const jobs = [sweepVendorQueue, deleteUnpaidShopOrders, expireUnpaidBookings, processPenalties, processMonthlyOverdue, runMonthlyCycle, sweepReplacements];
+  const jobs = [purgeDeletedAuthUsers, auditAuthUsers, sweepVendorQueue, deleteUnpaidShopOrders, expireUnpaidBookings, processPenalties, processMonthlyOverdue, runMonthlyCycle, sweepReplacements, coachDailyNotice, memberSessionReminders, coachEvaluationPrompts];
   const failed = [];
   for (const job of jobs) {
     const err = await withRetry(job);

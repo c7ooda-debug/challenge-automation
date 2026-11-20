@@ -7,6 +7,7 @@
 // 7) إشعار جدول المدرب اليومي الساعة 6 صباحًا (يُسجَّل لكل مدرب على حدة)
 // 8) تذكير اللاعبين/أولياء الأمور بحصص اليوم: إشعار صباحي + تذكير قبل الحصة بساعتين
 // 9) حذف حسابات الدخول نهائياً بعد حذف العضو من التطبيق   10) فحص الحسابات عند الطلب (حسابات بلا ملف / ملفات بلا حساب)
+// 11) تذكير الأدمن باعتماد جداول المدربين لغد (من 6 م، ومتابعة 9 م)   12) فريق كل مدرب (coach_players) بعد أن صارت القواعد تحجب غير الأيام المعتمدة
 
 const admin = require("firebase-admin");
 const FieldValue = admin.firestore.FieldValue;
@@ -1150,6 +1151,10 @@ async function coachDailyNotice() {
     if (done.has(u.id)) continue;
     const coachDocId = u.data().coachDocId;
     if (!coachDocId) { await ref.update({ coachNoticeDone: FieldValue.arrayUnion(u.id) }); continue; }
+    // v71: المدرب لا يرى يومًا إلا بعد اعتماد الإدارة له (coach_day_release/{التاريخ}_{coachDocId}).
+    // لو لم يُعتمد اليوم لا نرسل ملخصًا؛ وعند الاعتماد لاحقًا يصله إشعار الاعتماد من التطبيق مباشرة.
+    const released = await db.collection("coach_day_release").doc(`${today}_${coachDocId}`).get();
+    if (!released.exists) { await ref.update({ coachNoticeDone: FieldValue.arrayUnion(u.id) }); continue; }
     const lines = [];
     (await db.collection("available_slots").where("coachId", "==", coachDocId).where("date", "==", today).get())
       .forEach((s) => { const d = s.data(); (d.bookedPlayers || []).forEach((p) => lines.push({ start: d.startTime, player: p.playerName, playerId: p.playerId })); });
@@ -1503,6 +1508,8 @@ async function coachEvaluationPrompts() {
   for (const u of coaches.docs) {
     const coachDocId = u.data().coachDocId;
     if (!coachDocId) continue;
+    // v72: المدرب لا يرى جدول اليوم (ولا تسمح له القواعد بقراءته) قبل اعتماد الإدارة، فلا نطلب منه تقييمًا
+    if (!(await db.collection("coach_day_release").doc(`${today}_${coachDocId}`).get()).exists) continue;
     const sessions = await coachTodaySessions(coachDocId, today);
     if (!sessions.length) continue;
     const ledger = ((await db.collection("coach_eval_state").doc(u.id).get()).data() || {}).done || {};
@@ -1579,9 +1586,78 @@ function eodMessage(list, today, soft) {
   };
 }
 
+// ---------- 11) تذكير الأدمن باعتماد جداول المدربين لغد ----------
+// كل يوم مستقل بذاته: المدرب لا يرى يومًا إلا بعد اعتماد الإدارة له (coach_day_release/{التاريخ}_{coachDocId}).
+// الاعتماد لغد يبدأ من 6 م. أول تذكير 6 م، ثم متابعة 9 م إن بقي من لم يُعتمد جدوله.
+const APPROVAL_REMIND_HOURS = [18, 21];
+async function adminApprovalReminder() {
+  const now = cairo();
+  const hour = now.getHours();
+  const slot = APPROVAL_REMIND_HOURS.filter((h) => hour >= h).pop();
+  if (slot === undefined) return;
+  const target = ymd(new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1));
+  const ref = db.collection("system_settings").doc("server_state");
+  const key = `${target}|${slot}`;
+  if (((await ref.get()).data() || {}).approvalRemindKey === key) return;
+  // مدربو الغد الذين لديهم لاعبون محجوزون
+  const byCoach = new Map();
+  (await db.collection("available_slots").where("date", "==", target).get()).forEach((s) => {
+    const d = s.data();
+    if (d.coachId && (d.bookedPlayers || []).length) byCoach.set(String(d.coachId), d.coachName || "");
+  });
+  const released = new Set();
+  (await db.collection("coach_day_release").where("date", "==", target).get()).forEach((r) => released.add(String(r.data().coachDocId || "")));
+  const pending = [...byCoach.entries()].filter(([id]) => !released.has(id));
+  await ref.set({ approvalRemindKey: key }, { merge: true }); // سجّل أولًا: لا يتكرر الإشعار
+  if (!pending.length) return;
+  const names = pending.map(([, n]) => n).filter(Boolean).slice(0, 4).join("، ");
+  await notifyAdmins({
+    title: "اعتمد جداول المدربين لغد",
+    titleEn: "Approve tomorrow's coach schedules",
+    body: `${pending.length} مدرب بانتظار الاعتماد (${target})${names ? `: ${names}` : ""}. افتح «اعتماد جدول المدربين».`,
+    bodyEn: `${pending.length} coach(es) are waiting for approval (${target}).`,
+    type: "schedule",
+    action: "coachRelease",
+  });
+  console.log("approval reminder sent:", pending.length);
+}
+
+// ---------- 12) فريق كل مدرب (coach_players) ----------
+// القواعد صارت تحجب عن المدرب غير الأيام المعتمدة، فلم يعد التطبيق يقدر على حساب قائمة لاعبيه من كل الحصص.
+// نحسبها هنا من حصص آخر 60 يومًا وما بعدها (مرتين يوميًا تقريبًا لتوفير القراءات).
+const TEAM_SYNC_EVERY_MS = 12 * 3600 * 1000;
+async function syncCoachTeams() {
+  const ref = db.collection("system_settings").doc("server_state");
+  const st = (await ref.get()).data() || {};
+  if (st.teamSyncAt && Date.now() - st.teamSyncAt < TEAM_SYNC_EVERY_MS) return;
+  await ref.set({ teamSyncAt: Date.now() }, { merge: true });
+  const from = ymd(new Date(cairo().getTime() - 60 * 24 * 3600 * 1000));
+  const byCoach = new Map();
+  (await db.collection("available_slots").where("date", ">=", from).get()).forEach((s) => {
+    const d = s.data();
+    if (!d.coachId) return;
+    const key = String(d.coachId);
+    if (!byCoach.has(key)) byCoach.set(key, new Set());
+    for (const p of d.bookedPlayers || []) if (p && p.playerId) byCoach.get(key).add(String(p.playerId));
+  });
+  const coaches = await db.collection("users").where("role", "==", "coach").get();
+  let changed = 0;
+  for (const u of coaches.docs) {
+    const coachDocId = u.data().coachDocId;
+    if (!coachDocId) continue;
+    const list = [...(byCoach.get(String(coachDocId)) || [])].sort();
+    const tRef = db.collection("coach_players").doc(u.id);
+    const cur = (await tRef.get()).data() || {};
+    if ([...(cur.playerIds || [])].map(String).sort().join(",") === list.join(",")) continue;
+    await tRef.set({ coachDocId, coachName: u.data().fullName || u.data().name || "", playerIds: list, updatedAt: FieldValue.serverTimestamp() });
+    changed++;
+  }
+  console.log("coach teams synced:", changed);
+}
+
 (async () => {
   if (process.env.MODE === "check") { await checkMode(); return; }
-  const jobs = [purgeDeletedAuthUsers, auditAuthUsers, sweepVendorQueue, deleteUnpaidShopOrders, expireUnpaidBookings, processPenalties, processMonthlyOverdue, runMonthlyCycle, sweepReplacements, coachDailyNotice, memberSessionReminders, coachEvaluationPrompts];
+  const jobs = [purgeDeletedAuthUsers, auditAuthUsers, sweepVendorQueue, deleteUnpaidShopOrders, expireUnpaidBookings, processPenalties, processMonthlyOverdue, runMonthlyCycle, sweepReplacements, coachDailyNotice, memberSessionReminders, coachEvaluationPrompts, adminApprovalReminder, syncCoachTeams];
   const failed = [];
   for (const job of jobs) {
     const err = await withRetry(job);
